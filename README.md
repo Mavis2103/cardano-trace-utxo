@@ -1,132 +1,419 @@
-# utxo-tracer
+# UTXO Tracer
 
-Cardano UTXO chain tracer with auto-fallback and native gRPC support.
+**Trace funds across the Cardano blockchain — backward from inputs, forward through spent outputs.**
 
-## Install
+A CLI tool and interactive graph visualizer for following UTXO chains. Supports multiple blockchain data providers with automatic fallback, CEX address detection, and an interactive Dash Cytoscape graph.
 
-```bash
-cd packages/py-tracer
-pip install -e .
-pip install pyvis   # for visualization (optional, for none mode skip)
+---
+
+## Architecture
+
+```
+utxo-tracer trace <tx_hash>#<output_index>
+      │
+      ▼
+   ┌─────────────────────────────────────────┐
+   │  CLI (click) — utxo_tracer/cli.py       │
+   │  Parses args, resolves provider, runs   │
+   │  trace, prints summary, launches Dash.  │
+   └────┬────────────────────────────────┬───┘
+        │                                │
+        ▼                                ▼
+   ┌──────────┐              ┌──────────────────┐
+   │ Provider │◄────────────▶│ Tracing Engine   │
+   │ (5 back- │              │ backward /       │
+   │ ends)    │              │ forward / both   │
+   └──┬───────┘              │ Async generators │
+      │                      │ Edge-based dedup │
+      ▼                      └──────────────────┘
+   ┌──────────┐
+   │ Fallback │──► utxorpc → blockfrost → koios → maestro
+   │ Provider │    (auto-retry on transient errors)
+   └──────────┘
+        │
+        ▼
+   ┌─────────────────────────────────────────┐
+   │  Dash Cytoscape Visualization           │
+   │  - Force-directed FR layout             │
+   │  - Color-coded by address              │
+   │  - Shapes by address type               │
+   │  - CEX nodes highlighted red            │
+   │  - Click node → detail panel            │
+   │  - Auto-saves positions on exit         │
+   └─────────────────────────────────────────┘
 ```
 
-## Quick Start
+---
+
+## Installation
 
 ```bash
-# Auto-fallback (default): tries utxorpc → blockfrost → koios → maestro
+# Create a virtual environment (Python ≥ 3.11)
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install the package
+pip install -e .
+```
+
+### Dependencies
+
+| Package | Use |
+|---------|-----|
+| `click` | CLI framework |
+| `httpx` | Async HTTP (Blockfrost, Koios, Maestro, Kupo) |
+| `rich` | Terminal output tables, panels, progress |
+| `dash` + `dash-cytoscape` | Interactive graph visualization |
+| `utxorpc` | gRPC client (UTxORPC provider) |
+| `grpcio` | gRPC runtime |
+| `pandas` | CSV export |
+| `python-dotenv` | `.env` file loading |
+
+---
+
+## Configuration
+
+Config priority (highest → lowest):
+
+```
+CLI flags > shell env vars > .env file > ~/.utxo-tracer/config.json > defaults
+```
+
+### Quick setup
+
+```bash
+# Store credentials persistently
+utxo-tracer config set --provider blockfrost --api-key MAINNET_XXX
+
+# Set a different provider as default
+utxo-tracer config set --provider utxorpc --api-key YOUR_KEY --make-default
+
+# See current config
+utxo-tracer config show
+
+# Clear saved config
+utxo-tracer config clear
+```
+
+### Environment variables
+
+```bash
+# Provider selection
+export UTXO_TRACER_PROVIDER=blockfrost
+
+# Blockfrost (also supports Demeter.run via dmtr-api-key auth)
+export BLOCKFROST_API_KEY=mainnet_XXX
+export BLOCKFROST_AUTH_TYPE=project_id
+export BLOCKFROST_ENDPOINT_URL=https://cardano-mainnet.blockfrost.io/api/v0
+
+# Koios
+export KOIOS_API_KEY=your_key
+export KOIOS_BASE_URL=https://api.koios.rest/api/v1
+
+# Maestro
+export MAESTRO_API_KEY=your_key
+export MAESTRO_BASE_URL=https://mainnet.gomaestro-api.org/v1
+
+# UTxORPC (high-throughput gRPC)
+export UTXORPC_API_KEY=your_key
+export UTXORPC_BASE_URL=mainnet.utxorpc.com
+
+# Kupmios (local node)
+export KUPO_URL=http://localhost:1442
+export OGMIOS_URL=http://localhost:1337
+```
+
+A `.env` file is auto-discovered from the current working directory, parent directories, and `~/.utxo-tracer/.env`.
+
+---
+
+## Usage
+
+### Trace a UTXO
+
+```bash
+# Basic backward trace (default direction, depth 5, auto-fallback)
+utxo-tracer trace abc123def456...#0
+
+# Specify provider and increase depth
+utxo-tracer trace abc123def456...#0 \
+    --provider blockfrost \
+    --api-key mainnet_XXX \
+    --max-depth 10
+
+# Forward trace (requires kupmios)
+utxo-tracer trace abc123def456...#0 \
+    --provider kupmios \
+    --direction forward \
+    --max-depth 10
+
+# Trace backward AND forward from the same UTXO
+utxo-tracer trace abc123def456...#0 \
+    --provider kupmios \
+    --direction both
+```
+
+### Output formats
+
+```bash
+# Default table
 utxo-tracer trace abc123...#0
 
-# Single provider
-utxo-tracer trace abc123...#0 --provider blockfrost --api-key mainnet_XXX
+# JSON to stdout
+utxo-tracer trace abc123...#0 --output json
 
-# UTxORPC gRPC (recommended, highest throughput)
-utxo-tracer trace abc123...#0 --provider utxorpc
-# with API key:
-utxo-tracer trace abc123...#0 --provider utxorpc --api-key YOUR_KEY
+# CSV files
+utxo-tracer trace abc123...#0 --output csv --export-csv ./my_trace
 
-# Demeter.run endpoint
-utxo-tracer trace abc123...#0 --provider utxorpc \
-  --base-url https://cardano-mainnet.utxorpc-m1.demeter.run
-
-# Forward trace (needs kupmios)
-utxo-tracer trace abc123...#0 --provider kupmios \
-  --kupo-url http://localhost:1442 \
-  --ogmios-url http://localhost:1337 \
-  --direction forward
-
-# Disable fallback (single provider only)
-utxo-tracer trace abc123...#0 --provider utxorpc --no-fallback
+# Export to JSON file
+utxo-tracer trace abc123...#0 --export-json trace.json
 ```
+
+### Options
+
+```
+UTXO format:   <tx_hash>#<output_index>
+  --provider     blockfrost | koios | maestro | kupmios | utxorpc
+  --direction    backward (default) | forward | both
+  --max-depth    Recursion depth (default: 5)
+  --fallback     Auto-fallback across providers (default: on)
+  --no-fallback  Single provider only
+  --output       table | json | csv
+  --cex-file     JSON file with exchange address registry
+  --depth-report Show node count per depth level
+  --no-cache     Skip local cache, always query providers
+```
+
+### Other commands
+
+```bash
+# Check provider connectivity
+utxo-tracer health --provider blockfrost
+
+# Show UTXO asset breakdown
+utxo-tracer assets abc123...#0
+
+# Manage cache
+utxo-tracer cache list
+utxo-tracer cache info
+utxo-tracer cache clear
+
+# Open cached trace visualization
+utxo-tracer open <cache-key>
+```
+
+### CEX detection
+
+```bash
+# Load CEX addresses from a JSON file
+utxo-tracer trace abc123...#0 --cex-file ./cex_registry.json
+```
+
+The JSON file format:
+
+```json
+{
+  "addr1q9...": {"name": "Binance", "type": "exchange", "confidence": "medium"}
+}
+```
+
+Or as a list:
+
+```json
+[{"address": "addr1q9...", "name": "Binance", "type": "exchange", "confidence": "medium"}]
+```
+
+---
 
 ## Providers
 
-| Provider | Protocol | Type | Rate Limit | Best For |
-|---|---|---|---|---|
-| `utxorpc` | **gRPC** native | Cloud/Self-host | **High** | Primary (fastest) |
-| `blockfrost` | REST API | Cloud | 30 req/min (free) | Fallback |
-| `koios` | REST API | Cloud | ~10 req/s | Fallback |
-| `maestro` | REST API | Cloud | ~5 req/s | Fallback |
-| `kupmios` | REST + gRPC | Local | **Unlimited** | Forward tracing |
+| Provider | Type | Backward | Forward | Auth |
+|----------|------|----------|---------|------|
+| **Blockfrost** | REST API | ✓ | ✗ | `project_id` / `bearer` / `dmtr-api-key` |
+| **Koios** | REST API | ✓ | ✗ | Bearer token (optional) |
+| **Maestro** | REST API | ✓ | ✗ | `x-api-key` |
+| **UTxORPC** | gRPC SDK | ✓ | ✓ | `x-api-key` / `dmtr-api-key` |
+| **Kupmios** | Kupo + Ogmios | ✓ | ✓ | Optional per-service |
 
-## UTxORPC gRPC Setup
+### Fallback chain
 
-UTxORPC 100% chạy trên gRPC (không phải REST). Cài đặt:
+By default, fallback is enabled. If the primary provider fails, the tool tries:
+`primary → utxorpc → blockfrost → koios → maestro`
 
-**Hosted (Demeter.run)** — miễn phí, throughput cao:
+Transient errors (timeouts, connection failures) are retried with exponential backoff (0.5s, 1s, 2s). Non-transient errors propagate immediately.
+
+### UTxORPC (recommended)
+
+High-throughput gRPC provider supports both backward and forward tracing. Can be self-hosted or used via Demeter.run.
+
 ```bash
-# Default trong provider — tự động dùng Demeter.run endpoint
-utxo-tracer trace abc123...#0 --provider utxorpc --api-key demeter_key
+# Demeter.run
+BLOCKFROST_AUTH_TYPE=dmtr-api-key BLOCKFROST_API_KEY=dmtr_XXX \
+BLOCKFROST_ENDPOINT_URL=https://cardano-mainnet.blockfrost.io/api/v0 \
+utxo-tracer trace abc123...#0 --provider blockfrost
 ```
 
-**Self-hosted (Docker)** — chạy local hoàn toàn:
+### Kupmios (local node)
+
+The only provider that supports native forward tracing. Requires a running [Kupo](https://github.com/cardanosolutions/kupo) and [Ogmios](https://ogmios.dev) instance.
+
 ```bash
-docker run -p 3001:3001 aniqventures/utxorpc-cardano
-# Hoặc với volume data:
-docker run -p 3001:3001 \
-  -v utxorpc-data:/app/config \
-  aniqventures/utxorpc-cardano \
-  --config /app/config/cardano.yaml
+utxo-tracer trace abc123...#0 \
+    --provider kupmios \
+    --kupo-url http://localhost:1442 \
+    --ogmios-url http://localhost:1337 \
+    --direction forward
 ```
 
-**Mainnet hosted API**:
-```bash
-# Không cần API key cho free tier
-utxo-tracer trace abc123...#0 --provider utxorpc --base-url https://mainnet.utxorpc.com
+---
+
+## Tracing modes
+
+### Backward tracing (default)
+
+Walks backward from the starting UTXO through transaction inputs. For each UTXO, fetches the transaction that created it, finds all input UTXOs consumed by that transaction, and continues recursively.
+
+Use case: find where funds **came from** — trace back to a CEX withdrawal, mining reward, or initial distribution.
+
+### Forward tracing
+
+Walks forward from the starting UTXO through spent outputs. For each UTXO's address, finds transactions that spent outputs going to that address, and follows their output UTXOs.
+
+Use case: find where funds **went** — trace through a hacker's wallet chain to a CEX deposit.
+
+### Both directions
+
+Runs backward first, then forward from the same starting UTXO. The graph shows both cash-in (backward) and cash-out (forward) edges in different colors.
+
+### Diamond pattern handling
+
+Both tracing engines use **edge-based deduplication** rather than node-based. This preserves all branches of diamond-shaped transaction patterns:
+
+```
+     X
+    / \
+   A   B      Both A→X and B→X edges are kept.
+    \ /
+     Y
 ```
 
-## Auto-Fallback
-
-**Default: ON** — Khi provider chính fail, tự động thử provider tiếp theo:
-
-```
-Primary → utxorpc → blockfrost → koios → maestro
-```
-
-Mỗi query retry 3 lần với exponential backoff (0.5s → 1s → 2s) trước khi sang provider kế.
-
-```
-✓ utxorpc is reachable      (primary)
-↑ Fallback: utxorpc failed, using blockfrost  (warn log)
-```
-
-Disable với `--no-fallback` để dùng single provider duy nhất.
+---
 
 ## Visualization
 
-| Mode | Deps | Mô tả |
-|---|---|---|
-| `pyvis` (default) | `pyvis` | Interactive HTML, chạy local, không cần tài khoản |
-| `none` | — | Không hiển thị gì |
+After every trace, a Dash Cytoscape graph opens at `http://127.0.0.1:8050`.
 
-## Environment Variables
+### Node encoding
+
+| Visual | Meaning |
+|--------|---------|
+| **Circle** | Wallet (key hash payment) |
+| **Diamond** | Script (smart contract) |
+| **Triangle** | Byron legacy address |
+| **Hexagon** | Stake reward account |
+| **Square** | Unknown address type |
+| **Gold border** | Starting UTXO |
+| **Red border** | CEX address detected |
+| **Fill color** | SHA-256 hash of address → HSL |
+
+### Interactions
+
+- **Click a node** → right-side detail panel shows address, ADA amount, assets
+- **Drag nodes** → positions are auto-saved on exit
+- **Scroll** → zoom in/out
+- **Pan** → click and drag background
+
+### Legend panels (left side)
+
+- **Type** — address type badges
+- **Address** — top 20 addresses by ADA with color dots
+- **Assets** — all native assets found in the trace (up to 30)
+
+---
+
+## Cache system
+
+All trace results are cached locally under `.utxo-cache/` in the working directory.
+
+```
+.utxo-cache/
+├── index.json      # Metadata index for all cached traces
+├── store.json      # Global store: all UTXOs + input edges ever seen
+├── traces/         # Per-trace metadata files (thin, references store)
+└── viz/            # Saved visualization state (node positions, zoom)
+```
+
+The global store (`store.json`) accumulates UTXOs across traces, accelerating future traces that revisit the same transactions. The store uses a v3 schema with proper direction semantics.
 
 ```bash
-UTXO_TRACER_PROVIDER=utxorpc              # default provider
-UTXORPC_API_KEY=your_key                  # UTxORPC API key (tùy chọn)
-UTXORPC_BASE_URL=https://mainnet.utxorpc.com  # UTxORPC endpoint
-BLOCKFROST_API_KEY=mainnet_XXX
-KOIOS_API_KEY=your_key
-MAESTRO_API_KEY=your_key
+utxo-tracer cache list   # Show all cached traces
+utxo-tracer cache info   # Storage statistics
+utxo-tracer cache clear  # Remove all cached data
+utxo-tracer open <key>   # Re-open a cached trace visualization
 ```
 
-## CLI Reference
+Use `--no-cache` to skip local cache entirely and always query providers.
+
+---
+
+## Project structure
 
 ```
-# Health check — test kết nối provider
-utxo-tracer health --provider utxorpc
-
-# Trace với full options
-utxo-tracer trace <tx_hash>#<index> \
-  --provider utxorpc \
-  --direction backward \
-  --max-depth 10 \
-  --visualize pyvis \
-  --output-html trace_result.html \
-  --fallback
-
-# Export data
-utxo-tracer trace <tx_hash>#0 --export-json result.json --export-csv result
-
-# Cấu hình mặc định
-utxo-tracer config set --provider utxorpc --api-key YOUR_KEY
+src/utxo_tracer/
+├── __init__.py                # Package version
+├── cli.py                     # Click CLI entrypoint (main)
+├── config.py                  # Config loading (env, file, overrides)
+├── cache.py                   # Trace caching & global store
+├── models.py                  # Dataclasses (OutRef, Asset, UTxONode, ...)
+├── utils.py                   # Address classification, hex/UTF-8 conversion
+├── cex/
+│   ├── __init__.py
+│   └── registry.py            # CEX address registry & matching
+├── providers/
+│   ├── __init__.py            # build_provider() factory
+│   ├── base.py                # Abstract Provider base class
+│   ├── blockfrost.py          # Blockfrost REST API
+│   ├── koios.py               # Koios REST API
+│   ├── maestro.py             # Maestro REST API
+│   ├── utxorpc.py             # UTxORPC gRPC (python-sdk)
+│   ├── kupmios.py             # Kupo + Ogmios (local node)
+│   └── fallback.py            # Multi-provider fallback with retries
+├── tracing/
+│   ├── __init__.py            # build_graph_from_steps()
+│   ├── backward.py            # Backward trace engine
+│   └── forward.py             # Forward trace engine
+└── graph/
+    ├── __init__.py
+    └── dash_app.py            # Dash Cytoscape visualization
 ```
+
+---
+
+## Development
+
+```bash
+# Install in editable mode with dev dependencies
+pip install -e .
+
+# The package uses hatchling build backend
+# pyproject.toml at project root
+```
+
+### Code conventions
+
+- Python 3.11+ with `from __future__ import annotations`
+- Async/await throughout for concurrent provider queries
+- Edge-based graph deduplication to preserve diamond patterns
+- Typed dataclasses for all domain models
+- Rich console output with structured tables and progress bars
+- Atomic file writes with temp + rename pattern
+
+### Testing
+
+Tests use `aiken check -m` conventions (see project-level test infrastructure).
+
+---
+
+## License
+
+Internal tool — Tracking UTXO.
